@@ -1,0 +1,40 @@
+{
+  "sigma_min": 0.005,
+  "sigma_max": 4.0,
+  "width": 256,
+  "depth": 3,
+  "network": {
+    "activation": "GELU",
+    "embed_dim": 64,
+    "fourier_scale": 0.25
+  },
+  "encoder": {
+    "channels": 64,
+    "dilations": [
+      1,
+      1,
+      2,
+      2,
+      4,
+      1
+    ],
+    "shift": 2,
+    "context": 48,
+    "activation": "GELU"
+  },
+  "train": {
+    "lr": 0.001,
+    "max_steps": 6000,
+    "eval_every": 100,
+    "patience": 15,
+    "folds": 5,
+    "crop": 160,
+    "centres": 8192,
+    "training": {
+      "weight_decay": 0.0001,
+      "warmup": 500,
+      "clip": 1.0,
+      "ema": 0.999
+    }
+  }
+}

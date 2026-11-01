@@ -1,0 +1,8 @@
+{
+  "sandiego": {"kind": "mat", "file": "Sandiego.mat"},
+  "abu-beach-4": {"kind": "mat", "file": "abu-beach-4.mat"},
+  "abu-airport-2": {"kind": "mat", "file": "abu-airport-2.mat"},
+  "pavia-u-a0.75": {"kind": "pavia", "directory": "pavia_university", "target": 9, "alpha": 0.75},
+  "muufl-campus1-220": {"kind": "muufl", "collection": "MUUFLGulfport/MUUFLGulfportDataCollection",
+                        "scene": "campus1", "columns": 220, "target": 0, "alpha": 0.1}
+}

@@ -1,0 +1,47 @@
+{
+  "scenes": [
+    "sandiego",
+    "abu-airport-2",
+    "abu-beach-4",
+    "muufl-campus1-220"
+  ],
+  "gmm_components": [
+    1,
+    2,
+    5,
+    10,
+    20
+  ],
+  "student_components": [
+    1,
+    2,
+    5,
+    10
+  ],
+  "reg_covar": 1e-06,
+  "dof_grid": [
+    2.5,
+    3,
+    4,
+    5,
+    7,
+    10,
+    15,
+    20,
+    30,
+    50,
+    100,
+    300,
+    1000
+  ],
+  "tails": [
+    0.01,
+    0.001
+  ],
+  "n_directions": 200,
+  "level": 0.01,
+  "split_seed": 0,
+  "direction_seed": 0,
+  "fit_seed": 0,
+  "reference_seed": 0
+}

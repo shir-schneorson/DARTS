@@ -220,5 +220,12 @@ __marimo__/
 # Claude
 CLAUDE.md
 .claude
-ruff.toml
-docs
+
+# macOS
+.DS_Store
+
+# Only the reproduction package is published; the rest of this checkout stays local
+/*
+!/.gitignore
+!/README.md
+!/repro/
