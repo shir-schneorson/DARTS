@@ -1,47 +1,13 @@
 {
-  "scenes": [
-    "sandiego",
-    "abu-airport-2",
-    "abu-beach-4",
-    "muufl-campus1-220"
-  ],
-  "gmm_components": [
-    1,
-    2,
-    5,
-    10,
-    20
-  ],
-  "student_components": [
-    1,
-    2,
-    5,
-    10
-  ],
-  "reg_covar": 1e-06,
-  "dof_grid": [
-    2.5,
-    3,
-    4,
-    5,
-    7,
-    10,
-    15,
-    20,
-    30,
-    50,
-    100,
-    300,
-    1000
-  ],
-  "tails": [
-    0.01,
-    0.001
-  ],
-  "n_directions": 200,
-  "level": 0.01,
-  "split_seed": 0,
-  "direction_seed": 0,
-  "fit_seed": 0,
-  "reference_seed": 0
+  "scenes": ["sandiego", "abu-beach-4", "pavia-u-a0.75", "muufl-campus1-220"],
+  "learning_rate": {"sandiego": 0.01, "abu-beach-4": 0.003, "pavia-u-a0.75": 0.003,
+                    "muufl-campus1-220": 0.003},
+  "fold": 0,
+  "rule_amplitudes": [0.015625, 4.0],
+  "local_window": {"guard": 3, "pixels_per_band": 2},
+  "gmm": {"components": {"sandiego": 2, "abu-beach-4": 7, "pavia-u-a0.75": 7,
+                         "muufl-campus1-220": 16},
+          "seed": 0, "reg_covar": 1e-06},
+  "lrao_objective_sigma": 0.005,
+  "timing_repeats": 3
 }

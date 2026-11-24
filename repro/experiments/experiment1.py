@@ -1,152 +1,194 @@
-"""Experiment 1: are tractable background families misspecified on the hyperspectral scenes?
+"""Experiment 1 (Table II and Fig. 1): DARTS and the baselines on four scenes.
 
-For every scene, Gaussian mixtures with K of `gmm_components` (K = 1 is the Gaussian) and Student-t
-mixtures with K of `student_components` are fitted by maximum likelihood on one random half of
-the scene's background pixels and tested on the other half; then the halves swap and the counts
-are pooled. The test (`calibration`): along the whitened target direction and `n_directions`
-random whitened directions of the training half, the share of held-out pixels in each tail of each
-fitted 1-D marginal, against the tail's probability. The reference repeats the protocol on draws
-from the model fitted to the first half, as many as the scene has background pixels: the test
-where the family is exactly right, at the scene's sample size and band count.
+San Diego and ABU-beach-4 contain real targets; Pavia University receives class 9 at amplitude
+0.75 and MUUFL signature 0 at 0.1 (configs/scenes.json). Each scene is whitened and screened on
+its own (configs/darts.json); configs/experiment1.json sets the rest. Rows, per scene:
+- AMF, ACE, CEM, and the local AMF and ACE (`baselines.classical`);
+- GMM-Rao and GMM-GLRT, with global and window weights (`baselines.gmm`), fitted on the
+  unscreened pixels;
+- DARTS Rao at the rule's sigma-hat, and Table II's reference row, DARTS GLRT at sigma-hat_G, the
+  level the rule's second stage picks from the GLRT's held-out PD (`noise_level.held_out_glrt`):
+  fold 0 of the recipe, from checkpoints/experiment1/<scene>.pt or trained anew with --train.
+The detectors run with their authors' code are stored rows (results/experiment1/baselines.csv).
 
-Background: the pixels labelled 0, or on MUUFL those outside every cloth panel's halo; there is no
-screen. The spectra are raw and t = d - m (MUUFL: lab signature 0). Writes <out>/runs.csv, one line
-per (scene, data, family, K), data "scene" or "reference": the mean train and held-out
-log-likelihood per pixel, per half whether the fit converged and, for the t mixtures, its dof, and
-per tail p and side the held-out share over p along t (`*_t_*`), its median over the random
-directions (`*_median_*`) and the share of random directions the binomial test rejects at
-`level` (`*_rejected_*`). `figures/figure1.py` draws it.
+The statistics are computed on the CPU, where the paper's numbers come from. A row's time is the
+mean of `timing_repeats` computations of its map from the fitted or trained model, after one
+warm-up: on --device for DARTS, on the CPU otherwise.
 
-Usage: python -m experiments.experiment1 [--data DIR] [--out DIR] [scene ...]
+Writes <out>/detectors.csv (scene, detector, sigma, auc, pd, pauc, time) and <out>/rule.csv
+(scene, sigma_hat, theta_hat, rho_hat, sigma_hat_g); with --train, also the models in
+<out>/checkpoints/.
+Usage, from repro/: python -m experiments.experiment1 [--train] [--device DEVICE] [--data DIR]
+[--out DIR]
 """
 
-import csv
+import argparse
+import copy
 import json
-import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from dartsdet import muufl, scenes
-from experiments.calibration import binomial_rejected, projections, tail_counts
-from experiments.cli import REPRO, arguments
-from experiments.gmm import GMM, cholesky_whitening
-from experiments.student_mixture import StudentMixture
+from baselines import gmm
+from baselines.classical import ace, cem, local_amf_ace, window_batches
+from dartsdet import data, noise_level, statistics, whitening
+from dartsdet.metrics import detection_metrics
+from dartsdet.model import DARTS, pixels
+from dartsdet.training import held_out, train
+from experiments import default_device, write
 
-Model = GMM | StudentMixture
-SIDES = ("upper", "lower")
-
-
-def background(entry: dict, data_dir: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    """(background spectra (N, B), signature t = d - m (B,)) of a registry entry, float64."""
-    if entry["kind"] == "mat":
-        scene = scenes.real_targets(data_dir / entry["file"])
-        spectra = scene.spectra()
-        keep, d = scene.labels == 0, scene.target
-    else:
-        campus = muufl.campus(data_dir / entry["collection"], entry["scene"], entry["columns"])
-        spectra = campus["cube"].reshape(-1, campus["cube"].shape[2], order="F")
-        halos = muufl.halo_mask(campus["cube"].shape[:2], campus["row"], campus["col"],
-                                campus["size"])
-        keep, d = ~scenes.fortran(halos), campus["signatures"][:, entry["target"]]
-    return torch.from_numpy(spectra[keep]), torch.from_numpy(d - spectra.mean(axis=0))
+REPRO = Path(__file__).resolve().parents[1]
 
 
-def fitter(family: str, k: int, config: dict) -> Callable[[torch.Tensor], Model]:
-    """The family's maximum-likelihood fit with K = k."""
-    if family == "gmm":
-        return lambda x: GMM.fit(x, k, config["fit_seed"], config["reg_covar"])
-    grid = torch.tensor(config["dof_grid"], dtype=torch.float64)
-    return lambda x: StudentMixture.fit(x, k, config["fit_seed"], config["reg_covar"], grid)
+def timed(compute: Callable[[], object], repeats: int) -> tuple[object, float]:
+    """compute()'s output and its mean seconds over `repeats` calls after one warm-up call;
+    compute must return CPU values, so that each call has finished."""
+    out = compute()
+    start = time.perf_counter()
+    for _ in range(repeats):
+        compute()
+    return out, (time.perf_counter() - start) / repeats
 
 
-def draws(model: Model, n: int, seed: int) -> torch.Tensor:
-    """n draws (n, B) from a fitted model, from torch's global generator seeded with `seed`."""
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        if isinstance(model, GMM):
-            z = model.distribution().sample((n,))
-            return model.shift + z @ torch.linalg.inv(model.unmix).T
-        components = torch.multinomial(model.weights, n, replacement=True)
-        dof = torch.tensor(model.dof, dtype=torch.float64)
-        scales = torch.distributions.Chi2(dof).sample((n,))
-    return model.sample(components, scales / model.dof, torch.Generator().manual_seed(seed))
+def row(scene: data.Scene, detector: str, score: np.ndarray, seconds: float | None = None,
+        sigma: float | None = None) -> dict:
+    """One output row: the metrics of a map (P,) on the scene's labels, to 6 decimals, so that
+    Table II rounds each value once."""
+    metrics = detection_metrics(scene.labels, score)
+    return {"detector": detector, "sigma": "" if sigma is None else f"{sigma:.4f}",
+            **{k: f"{v:.6f}" for k, v in metrics.items()},
+            "time": "" if seconds is None else f"{seconds:.3f}"}
 
 
-def two_fold(x: torch.Tensor, t: torch.Tensor, fit: Callable[[torch.Tensor], Model],
-             config: dict) -> tuple[dict, Model]:
-    """Fit on each half, test on the other: (pooled counts, mean log-likelihoods, and per half
-    the dof and whether the fit converged; the model fitted to the first half)."""
-    halves = torch.from_numpy(np.random.default_rng(config["split_seed"]).permutation(len(x)))
-    counts, ll_train, ll_test, dofs, converged, first = {}, 0.0, 0.0, [], [], None
-    for train, test in zip(halves.chunk(2), reversed(halves.chunk(2)), strict=True):
-        model = fit(x[train])
-        first = model if first is None else first
-        a = projections(t, cholesky_whitening(x[train])[1], config["n_directions"],
-                        config["direction_seed"])
-        for key, c in tail_counts(*model.marginal_cdf(x[test], a), config["tails"]).items():
-            counts[key] = counts.get(key, 0) + c
-        ll_train += float(model.log_prob(x[train]).sum())
-        ll_test += float(model.log_prob(x[test]).sum())
-        dofs.append(getattr(model, "dof", None))
-        converged.append(model.converged)
-    return {"counts": counts, "ll_train": ll_train / len(x), "ll_test": ll_test / len(x),
-            "dofs": dofs, "converged": converged}, first
+def classical_rows(scene: data.Scene, inputs: whitening.Inputs, config: dict) -> list[dict]:
+    """AMF, ACE, CEM and the local AMF and ACE; the local pair shares one computation and time."""
+    exists, repeats = scene.exists, config["timing_repeats"]
+    window = config["local_window"]
+    need = window["pixels_per_band"] * scene.cube.shape[2]
+
+    def full(compute: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> np.ndarray:
+        out = np.zeros(len(exists))
+        out[exists] = compute(inputs.fx[torch.from_numpy(exists)].numpy(), inputs.t.numpy())
+        return out
+
+    rows = [row(scene, name, *timed(lambda f=f: full(f), repeats)) for name, f in
+            (("AMF", whitening.amf), ("ACE", ace),
+             ("CEM", lambda *_: cem(scene.spectra()[exists], scene.target)))]
+    (local_amf, local_ace), seconds = timed(lambda: local_amf_ace(
+        inputs.fx, inputs.usable, inputs.t, window_batches(
+            inputs.usable, torch.from_numpy(exists), inputs.grid, window["guard"], need)), repeats)
+    return rows + [row(scene, "Local AMF", local_amf, seconds),
+                   row(scene, "Local ACE", local_ace, seconds)]
 
 
-def record(result: dict, n: int, config: dict) -> dict:
-    """The runs.csv columns of a `two_fold` result over n pixels."""
-    out = {"ll_train": result["ll_train"], "ll_test": result["ll_test"],
-           "converged": "/".join("yes" if c else "no" for c in result["converged"]),
-           "dof": "/".join(f"{d:g}" for d in result["dofs"]) if result["dofs"][0] else ""}
-    for (side, p), c in result["counts"].items():
-        out[f"{side}_t_{p:g}"] = c[0] / (n * p)
-        out[f"{side}_median_{p:g}"] = float(np.median(c[1:])) / (n * p)
-        out[f"{side}_rejected_{p:g}"] = float(binomial_rejected(c[1:], n, p,
-                                                                config["level"]).mean())
-    return out
+def gmm_rows(scene: data.Scene, inputs: whitening.Inputs, components: int,
+             config: dict) -> list[dict]:
+    """GMM-Rao and GMM-GLRT with global and window weights, the mixture fitted on the unscreened
+    pixels; each map timed from the fitted mixture."""
+    settings, window = config["gmm"], config["local_window"]
+    model = gmm.fit(inputs.fx[inputs.usable], components, settings["seed"], settings["reg_covar"])
+    need = window["pixels_per_band"] * scene.cube.shape[2]
+
+    def score(test: Callable, spatial: bool) -> np.ndarray:
+        terms, weights = gmm.line(model, inputs.fx, inputs.t), model.weights.double().log()
+        if spatial:
+            batches = window_batches(inputs.usable, torch.from_numpy(scene.exists), inputs.grid,
+                                     window["guard"], need)
+            weights = gmm.window_weights(weights, terms, inputs.usable, batches)
+        return test(weights, terms).numpy()
+
+    return [row(scene, name, *timed(lambda t=test, s=spatial: score(t, s),
+                                    config["timing_repeats"]))
+            for name, test, spatial in (("GMM-Rao", gmm.rao, False), ("GMM-GLRT", gmm.glrt, False),
+                                        ("GMM-Rao, window", gmm.rao, True),
+                                        ("GMM-GLRT, window", gmm.glrt, True))]
 
 
-def scene_rows(name: str, x: torch.Tensor, t: torch.Tensor, config: dict) -> list[dict]:
-    """Every (data, family, K) line of one scene."""
-    lines = []
-    for family, ks in (("gmm", config["gmm_components"]),
-                       ("student", config["student_components"])):
-        for k in ks:
-            result, model = two_fold(x, t, fitter(family, k, config), config)
-            reference, _ = two_fold(draws(model, len(x), config["reference_seed"]), t,
-                                    fitter(family, k, config), config)
-            for data, res in (("scene", result), ("reference", reference)):
-                lines.append({"scene": name, "data": data, "family": family, "components": k,
-                              "pixels": len(x), "bands": x.shape[1],
-                              **record(res, len(x), config)})
-            print(name, family, k, f"held-out log-likelihood {result['ll_test']:.2f}",
-                  flush=True)
-    return lines
+def choice(scene: data.Scene, inputs: whitening.Inputs, model: DARTS, recipe: dict,
+           config: dict) -> dict:
+    """The rule's choice on a scene (`noise_level.select`): held-out reads on the model's held-out
+    fold, the scene's screened pixels as the pool."""
+    rule = noise_level.Rule.from_config(recipe, tuple(config["rule_amplitudes"]))
+    held = held_out(inputs.usable, config["fold"], recipe["training"]["folds"])[0]
+    pool = torch.from_numpy(np.flatnonzero(scene.exists & ~inputs.usable.numpy()))
+    reads = noise_level.held_out_reads(model, inputs, held, rule)
+    return noise_level.select(model, reads, inputs, pool, rule)
+
+
+def glrt_level(inputs: whitening.Inputs, model: DARTS, recipe: dict, config: dict,
+               theta_hat: float, amplitudes: torch.Tensor) -> float:
+    """sigma-hat_G: the rule's second stage, eq. (sigma-hat), on the plug-in GLRT's held-out PD
+    over [theta-hat / 2, theta-hat], theta-hat the rule's own."""
+    rule = noise_level.Rule.from_config(recipe, tuple(config["rule_amplitudes"]))
+    held = held_out(inputs.usable, config["fold"], recipe["training"]["folds"])[0]
+    pd = noise_level.held_out_glrt(model, inputs, held, rule, amplitudes)
+    i = int(np.argmin(np.abs(np.asarray(rule.thetas) - theta_hat)))
+    return rule.sigmas[int(np.argmax(noise_level.band_average(pd, i, rule)))]
+
+
+def darts_rows(scene: data.Scene, inputs: whitening.Inputs, model: DARTS, recipe: dict,
+               config: dict, device: str) -> tuple[list[dict], dict]:
+    """(DARTS Rao at sigma-hat and DARTS GLRT at sigma-hat_G, each timed on `device`; the rule's
+    choice with sigma_hat_g)."""
+    chosen = choice(scene, inputs, model, recipe, config)
+    grid = recipe["glrt_amplitudes"]
+    amplitudes = torch.logspace(grid["log10_first"], grid["log10_last"], grid["count"])
+    chosen["sigma_hat_g"] = glrt_level(inputs, model, recipe, config, chosen["theta_hat"],
+                                       amplitudes)
+    on_device = copy.deepcopy(model).to(device)
+    zd, md = on_device.image(inputs.fx, inputs.usable, inputs.grid)
+    z, mask = model.image(inputs.fx, inputs.usable, inputs.grid)
+    rows = []
+    for name, sigma, test in (("DARTS Rao", chosen["sigma_hat"], statistics.rao),
+                              ("DARTS GLRT", chosen["sigma_hat_g"], statistics.glrt)):
+        extra = (amplitudes,) if test is statistics.glrt else ()
+        _, seconds = timed(lambda s=sigma, f=test, e=extra: f(
+            on_device, pixels(zd), statistics.contexts(on_device, zd, md, s), inputs.t, s,
+            *e).cpu(), config["timing_repeats"])
+        score = test(model, pixels(z), statistics.contexts(model, z, mask, sigma), inputs.t,
+                     sigma, *extra)
+        rows.append(row(scene, name, score.double().numpy(), seconds, sigma))
+    return rows, chosen
 
 
 def main() -> None:
-    config = json.loads((REPRO / "configs" / "experiment1.json").read_text())
-    parser = arguments(__doc__, "experiment1", device=False, data=True, checkpoints=False)
-    parser.add_argument("scenes", nargs="*", default=config["scenes"], help="scenes to run")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--train", action="store_true", help="retrain DARTS instead of loading")
+    parser.add_argument("--device", default=default_device())
+    parser.add_argument("--data", type=Path, default=REPRO.parent / "data")
+    parser.add_argument("--out", type=Path, default=REPRO / "outputs" / "experiment1")
     args = parser.parse_args()
-    if unknown := sorted(set(args.scenes) - set(config["scenes"])):
-        parser.error(f"unknown scenes {unknown}; choose from {config['scenes']}")
+    recipe = json.loads((REPRO / "configs" / "darts.json").read_text())
+    config = json.loads((REPRO / "configs" / "experiment1.json").read_text())
     registry = json.loads((REPRO / "configs" / "scenes.json").read_text())
-    columns = ["scene", "data", "family", "components", "pixels", "bands", "ll_train", "ll_test",
-               "converged", "dof", *(f"{side}_{kind}_{p:g}" for p in config["tails"]
-                                     for side in SIDES for kind in ("t", "median", "rejected"))]
     args.out.mkdir(parents=True, exist_ok=True)
-    out = args.out / "runs.csv"
-    with out.with_suffix(".partial").open("w", newline="", buffering=1) as f:
-        writer = csv.DictWriter(f, columns)
-        writer.writeheader()
-        for name in args.scenes:
-            x, t = background(registry[name], args.data)
-            writer.writerows(scene_rows(name, x, t, config))
-    os.replace(out.with_suffix(".partial"), out)
+    rows, rules = [], []
+    for name in config["scenes"]:
+        start = time.time()
+        scene = data.load(registry[name], args.data)
+        inputs = whitening.prepare(scene, recipe["screen"])
+        if args.train:
+            model, record = train(inputs, recipe, config["learning_rate"][name], config["fold"],
+                                  args.device)
+            (args.out / "checkpoints").mkdir(exist_ok=True)
+            model.cpu().save(args.out / "checkpoints" / f"{name}.pt", **record)
+        else:
+            model = DARTS.load(REPRO / "checkpoints" / "experiment1" / f"{name}.pt")
+        darts, chosen = darts_rows(scene, inputs, model, recipe, config, args.device)
+        here = (classical_rows(scene, inputs, config)
+                + gmm_rows(scene, inputs, config["gmm"]["components"][name], config) + darts)
+        rows += [{"scene": name} | r for r in here]
+        rules.append({"scene": name, **{k: f"{chosen[k]:.4f}" for k in
+                                        ("sigma_hat", "theta_hat", "rho_hat", "sigma_hat_g")}})
+        for r in here:
+            print(name, " ".join(f"{k} {v}" for k, v in r.items() if v != ""), flush=True)
+        print(name, rules[-1], f"{time.time() - start:.0f} s", flush=True)
+        write(args.out / "detectors.csv", rows)
+        write(args.out / "rule.csv", rules)
 
 
 if __name__ == "__main__":

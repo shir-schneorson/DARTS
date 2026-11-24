@@ -1,152 +1,120 @@
 # DARTS
 
-Code for *From Diffusion Models to Score Tests: Detecting Weak Signals in Non-Gaussian Noise*.
+Code for *From Diffusion Models to Score Tests: Target Detection under General Background
+Distributions*.
 
-DARTS detects a target of known signature in a hyperspectral scene with the Rao test. For weak
-additive targets this test is locally most powerful, and it needs the background only through its
-score function. DARTS learns that score from the scene itself, by denoising score matching,
-conditioned on each pixel's spatial neighbourhood:
+The paper detects a known signature `t` of unknown amplitude in a non-Gaussian background with the
+Rao (locally most powerful) test. The test needs the background only through its score function,
+and DARTS learns that score from the scene itself by denoising score matching. A blind-spot
+encoder conditions each pixel's score on its spatial neighbourhood, so the test reads
 
 ```
-A(x) = -t' s_sigma(x | c)
+U_sigma(x | c) = -t' s_sigma(x | c)
 ```
 
-Here `t` is the unit signature, `c` the pixel's context, and `s_sigma` the score of the background
-smoothed at noise level `sigma`. The context comes from a blind-spot convolutional encoder, which
-never sees the pixel itself or its 3 x 3 neighbourhood. One noise level per scene is chosen without
-labels (Section VII of the paper, `dartsdet/noise_level.py`). The detector is an ensemble of five
-models, each trained with one fold of the pixels held out.
+with `s_sigma` the score of the background smoothed at noise level `sigma`, and `c` the pixel's
+context. The noise level is not a nuisance: smoothing tunes the Rao test to a target amplitude. A
+two-stage rule chooses it without labels. It first estimates the amplitude from how the scene's
+screened pixels respond across levels, then picks the level at which held-out pixels with
+implants of that amplitude are detected best (`dartsdet/noise_level.py`).
 
-## Installation
+## Install
 
-The paper's numbers were produced with Python 3.11.16 and the versions in `requirements.txt`.
+The paper's numbers were produced with Python 3.11.16 and the versions in `requirements.txt` on an
+Apple M4 Pro: the statistics on its CPU, training and Table II's DARTS timings on its GPU, through
+PyTorch's MPS backend.
 
 ```bash
 pip install -r requirements.txt
-pip install -e ".[figures,test]"
+pip install -e .
 ```
-
-The library needs numpy, scipy, scikit-learn and PyTorch; the figures also need matplotlib, and
-the tests pytest.
 
 ## Data
 
-The scenes are not redistributed here. Place them under `data/`, or pass `--data DIR`, and check
-them with `shasum -a 256 -c SHA256SUMS`.
+The scenes are not redistributed. From this directory, run
+
+```bash
+python -m dartsdet.fetch
+```
+
+This downloads San Diego and ABU-beach-4 from the HTD-Mamba repository, and MUUFL Gulfport from
+the GatorSense repository, into `../data/`. Each file is checked against `SHA256SUMS`. The source of
+Pavia University refuses scripted downloads, so put `PaviaU.mat` and `PaviaU_gt.mat` in
+`../data/pavia_university/` by hand. The page is listed below, and a second run of the command
+checks them.
 
 | Scene | Files under `data/` | Source |
 |---|---|---|
-| San Diego | `Sandiego.mat` (`data` 100 x 100 x 189, `map`) | `datasets/Sandiego.mat` in the HTD-Mamba repository, github.com/shendb2022/HTD-Mamba |
-| ABU-beach-4 | `abu-beach-4.mat` (`data` 150 x 150 x 102, `map`) | `datasets/abu-beach-4.mat` in the same repository |
-| ABU-airport-2 (Experiment 1) | `abu-airport-2.mat` (`data` 100 x 100 x 205, `map`) | `datasets/abu-airport-2.mat` in the same repository |
-| Pavia University | `pavia_university/PaviaU.mat`, `pavia_university/PaviaU_gt.mat` | the Pavia University scene and its ground truth (M. Graña, M. A. Veganzones and B. Ayerdi, "Hyperspectral Remote Sensing Scenes – Pavia University (ROSIS, data courtesy of Prof. Paolo Gamba, Univ. of Pavia)," Grupo de Inteligencia Computacional (GIC), UPV/EHU, 2011; https://www.ehu.eus/ccwintco/index.php/Hyperspectral_Remote_Sensing_Scenes); the checksums identify the files used |
-| MUUFL Gulfport | `MUUFLGulfport/MUUFLGulfportDataCollection/muufl_gulfport_campus_w_lidar_1.mat`, `.../tgt_lab_spectra.mat` | the MUUFL Gulfport data collection (P. Gader et al., Tech. Rep. REP-2013-570, University of Florida, 2013; doi:10.5281/zenodo.1186326) |
+| San Diego | `Sandiego.mat` | `datasets/` of github.com/shendb2022/HTD-Mamba |
+| ABU-beach-4 | `abu-beach-4.mat` | the same repository; the scene is from X. Kang, X. Zhang, S. Li, K. Li, J. Li and J. A. Benediktsson, "Hyperspectral Anomaly Detection With Attribute and Edge-Preserving Filters," IEEE Trans. Geosci. Remote Sens., 55(10):5600–5611, 2017 |
+| Pavia University | `pavia_university/PaviaU.mat`, `PaviaU_gt.mat` | M. Graña, M. A. Veganzones and B. Ayerdi, "Hyperspectral Remote Sensing Scenes – Pavia University (ROSIS, data courtesy of Prof. Paolo Gamba, Univ. of Pavia)," GIC, UPV/EHU, 2011, https://www.ehu.eus/ccwintco/index.php/Hyperspectral_Remote_Sensing_Scenes |
+| MUUFL Gulfport | `MUUFLGulfport/MUUFLGulfportDataCollection/muufl_gulfport_campus_w_lidar_1.mat`, `tgt_lab_spectra.mat` | P. Gader et al., Tech. Rep. REP-2013-570, University of Florida, 2013; github.com/GatorSense/MUUFLGulfport |
 
-The MUUFL target halos (`dartsdet/muufl.py`) port Bullwinkle's scoring windows: T. Glenn, A. Zare,
-P. Gader, D. Dranishnikov. (2016). Bullwinkle: Scoring Code for Sub-pixel Targets (Version 1.0)
-[Software]. GatorSense/MUUFLGulfport.
-
-San Diego and ABU-beach-4 have real targets. Pavia University and MUUFL receive implanted ones:
-the mean spectrum of class 9 at amplitude 0.75 in Pavia University, whose 59 pixels clipped at
-8000 DN are left out, and lab signature 0 (Soil Brown) at amplitude 0.1 in the first 220 columns
-of MUUFL campus 1. The implants follow one protocol (`dartsdet/scenes.py`): one implant per 100
-scored background pixels, at least 3 pixels apart, with the sites drawn from seed 0. Pixels of the
-implanted material's real instances are not scored.
+The MUUFL scoring windows follow Bullwinkle: T. Glenn, A. Zare, P. Gader and D. Dranishnikov,
+GatorSense/MUUFLGulfport, 2016.
 
 ## Reproducing the paper
 
-Run from this directory. `--help` lists each command's options and defaults.
+Run from this directory. Each experiment scores the committed checkpoints (`checkpoints/`; check
+them with `shasum -a 256 -c checkpoints/SHA256SUMS`, which pytest also does) on the CPU and writes
+to `outputs/`. The scripts in `paper/` draw the tables and figures from `results/`, the committed
+reference outputs; pass `--results outputs/experimentN` to draw them from your own run instead.
+`paper.figure1` also recomputes DARTS's San Diego map, so it needs the data, and it uses the model
+of a `--train` run when `--results` holds one.
 
-| Result | Command | Output |
+| Paper | Commands | Time (CPU) |
 |---|---|---|
-| Fig. 1 (Experiment 1) | `python -m experiments.experiment1` | `results/experiment1/runs.csv` |
-| | `python -m figures.figure1` | `results/figure1.pdf` |
-| Fig. 2 (Experiment 2) | `python -m experiments.experiment2` | `results/experiment2/` |
-| | `python -m figures.figure2` | `results/figure2.pdf` |
-| Fig. 3 (Experiment 3) | `python -m experiments.experiment3` | `results/experiment3/seed<s>.csv` |
-| | `python -m figures.figure3` | `results/figure3.pdf` |
-| Fig. 4 (Experiment 4) | `python -m experiments.experiment4 pavia`, then `muufl` | `results/experiment4/<background>.csv` |
-| | `python -m figures.figure4` | `results/figure4.pdf` |
-| Fig. 5 (Experiment 5) | `python -m experiments.experiment5` | `results/experiment5/curves.npz` |
-| | `python -m figures.figure5` | `results/figure5.pdf` |
-| Tables I and II, DARTS rows (Experiment 6) | `python -m experiments.experiment6` | `results/experiment6/<scene>.json` |
+| Table II, Fig. 1 | `python -m experiments.experiment1`, then `python -m paper.table2` and `python -m paper.figure1` | 8 min |
+| Fig. 2 | `python -m experiments.experiment2`, then `python -m paper.figure2` | 3 min |
+| Fig. 3 | `python -m experiments.experiment3`, then `python -m paper.figure3` | 13 min |
+| Table III, Fig. 4 | `python -m experiments.experiment4`, then `python -m paper.table3` and `python -m paper.figure4` | 6 min |
 
-Experiment 1 uses the real-target scenes and MUUFL campus 1 with its own cloth targets, without
-implants. In Experiment 2, panel (a) of Fig. 2 is computed exactly; the networks behind panels (b)
-and (c) are seeded here, while the paper's were initialized from an unseeded generator, so a rerun
-repeats exactly but does not regenerate the paper's values of those two panels.
+`python -m paper.web` redraws the project page's figures and tables (`site/`) from `results/`.
 
-Each Experiment 6 file holds `sigma`, the noise level chosen, and the AUC, PD at a false-alarm rate
-of 1e-3 and standardized partial AUC up to that rate under `labels`. For MUUFL it also holds them
-under `masked`, which leaves out the pixels around every emplaced cloth panel; Table II reports
-those. From the paper's fold models, Experiment 6 gives:
+The experiments hold one scene in memory at a time; the largest run needs about 4 GB of RAM.
+Experiment 4 scores the shipped Experiment 1 and 3 models and reads their noise levels from
+`results/experiment3/`; it refuses the output of a `--train` run. Each script's `--help` prints its
+docstring: what it computes, from which files, and where it writes. Table II's DARTS rows are its
+Rao test at the rule's level sigma-hat and, as a reference, its plug-in GLRT at sigma-hat_G, the
+level the rule's second stage picks from the GLRT's held-out detection probability:
 
-| Scene | sigma | AUC | PD at 1e-3 | partial AUC |
-|---|---|---|---|---|
-| San Diego | 0.1651 | 0.9995 | 0.914 | 0.847 |
-| ABU-beach-4 | 0.1033 | 0.9435 | 0.588 | 0.757 |
-| Pavia University | 0.0866 | 0.9979 | 0.875 | 0.858 |
-| MUUFL campus 1 (`masked`) | 0.1052 | 0.9989 | 0.956 | 0.923 |
+| Scene | sigma-hat | AUC | PD at PF = 1e-3 | partial AUC | sigma-hat_G | GLRT PD |
+|---|---|---|---|---|---|---|
+| San Diego | 0.6431 | 0.9987 | 0.897 | 0.843 | 0.1710 | 0.879 |
+| ABU-beach-4 | 0.2659 | 0.9332 | 0.647 | 0.778 | 0.0707 | 0.603 |
+| Pavia University (class 9, amplitude 0.75) | 0.1100 | 0.9978 | 0.904 | 0.906 | 0.0707 | 0.909 |
+| MUUFL campus 1 (signature 0, amplitude 0.1) | 0.4135 | 0.9996 | 0.972 | 0.963 | 0.1710 | 0.974 |
 
-### Models and run time
+**Stored rows.** Some numbers are stored, not computed:
+- the detectors run with their authors' code: LRao, OS-VAE, TSTTD, CS-TTD, HTD-Mamba, E-CEM and
+  hCEM. Their Table II rows are in `results/experiment1/baselines.csv`, and the E-CEM and CS-TTD
+  maps of Fig. 1 in `sandiego-maps.npz`. Each was run with its authors' own recipe.
+- Fig. 3's curves of the DARTS network trained with LRao's objective
+  (`results/experiment3/<background>-lrao-objective.csv`). Three of the runs' checkpoints were
+  lost, so that column cannot be recomputed.
 
-A fold model is trained the first time it is needed, and loaded from `--checkpoints` afterwards:
+**Retraining.** `--train` on Experiments 1, 2 and 3 trains the DARTS models anew from
+`configs/`, on `--device` (MPS or CUDA by default when available), for at most 20,000 steps. As in
+the paper, training stops early on the held-out loss in Experiment 1 and on MUUFL in Experiment 3;
+Experiment 2 (4,000 steps) and Pavia University in Experiment 3 run their full length and keep the
+final weights. On the M4 Pro's GPU, a model of Experiment 1 or 3 took about two hours, and
+Experiment 2's ten small networks about 75 minutes in all. Training is seeded, and so is every draw the experiments make. On the CPU, a rerun with the
+same number of threads repeats bit for bit (a test checks it). GPU kernels are not guaranteed to
+be deterministic, and early stopping reads a held-out loss computed on the device, so a retrain
+on another backend or build can stop at another step and give other weights.
 
-```
-checkpoints/experiment3/seed<s>/{darts,dart}.pt
-checkpoints/experiment4/<background>/fold0.pt
-checkpoints/experiment5/n<n>_s<seed>.pt
-checkpoints/experiment6/<scene>/fold<j>.pt
-```
-
-A saved model is refused unless it was trained with the current recipe and seed, and a DARTS
-fold model also unless it was trained as the same fold on the same pixels.
-
-The paper's trained models (44 files, 67 MiB) are not part of this repository. With them in place,
-the experiments reproduce the paper's numbers as described under Checks. Without them, the
-experiments train their own. Experiment 5's models then come out identical to the paper's, which
-were trained on the CPU. The other models were trained on a GPU with PyTorch's MPS backend, so
-retrained ones agree with them only up to that arithmetic; how far the reported numbers then move
-has not been measured.
-
-Training is best done on a GPU. A Pavia University fold took about an hour on an Apple M4 Pro GPU.
-After training, Experiment 6 takes on a CPU about 45 s for San Diego, 90 s for ABU-beach-4, 4 min
-for MUUFL and 13 min for Pavia University. Experiment 4 computes 65 GLRTs, about 95 s each for
-Pavia University and 35 s for MUUFL on the same GPU, and several times longer on a CPU.
-Experiments 1, 2 and 5 run on the CPU: Experiment 5, training included, takes about 25 minutes,
-and Experiments 1 and 2 each took under an hour while sharing the CPU with other jobs.
-
-Every draw is seeded: implant sites, folds, model initialization, training batches, and the
-rule's pixel samples and noise. On the CPU a rerun with the same number of threads repeats bit for
-bit; Experiments 2 and 5 fix theirs (8 and 4), since the thread count moves float reductions. GPU
-kernels are not guaranteed to be deterministic, so on a GPU a retrained model can differ in the
-last bits, and early stopping can turn that into a different stopping step.
-
-## Using DARTS on your own scene
-
-```python
-import json
-from pathlib import Path
-
-from dartsdet import evaluation, noise_level, pipeline, preprocessing
-from dartsdet.scenes import Scene
-
-# cube (H, W, B); labels, exists (H W,) in Fortran pixel order; target (B,); see dartsdet/scenes.py
-scene = Scene(cube, labels, exists, target, additive=False)
-inputs = preprocessing.prepare(scene)
-spec = json.loads(Path("configs/darts.json").read_text())
-sigmas = noise_level.grid(spec["sigma_max"])
-models = [pipeline.fold_model(inputs, spec, j, "cuda", Path(f"checkpoints/mine/fold{j}.pt"))
-          for j in range(spec["train"]["folds"])]
-reads = [pipeline.rule_reads(m, inputs, scene.exists, j, sigmas, "cuda")
-         for j, m in enumerate(models)]
-sigma = pipeline.sigma_hat(reads, sigmas)
-score = evaluation.ensemble([pipeline.statistic(m, inputs, sigma, "cuda") for m in models],
-                            scene.exists)
-detection_map = score.reshape(cube.shape[:2], order="F")
-```
-
-Labels are only needed for `evaluation.detection_metrics`; without them, pass zeros.
+**Notes on reproducing exactly.**
+- Times in Table II depend on the machine. As the caption says, DARTS, TSTTD, CS-TTD and
+  HTD-Mamba were timed on the M4 Pro's GPU (the package times DARTS on `--device`), the other rows
+  on the CPU.
+- Table II's DARTS models are the last checkpoint, at a multiple of 500 steps, at or before the
+  lowest held-out loss. Pavia University's is the step-12000 checkpoint of a run stopped by hand
+  at step 12400, so `--train`, which stops by patience, trains it longer.
+- The paper's Fig. 1 was drawn from the San Diego model's step-4900 checkpoint, the package's from
+  Table II's step 4500; the false alarms and misses are the same, only the gray shading differs.
+- Fig. 4 is set in Arial, like the paper's; without it, matplotlib falls back to DejaVu Sans.
+- Table III's factor omega uses the paper's draws: 30,000 background pixels per scene from one
+  seeded generator per background (`configs/experiment4.json`).
 
 ## Checks
 
@@ -154,51 +122,36 @@ Labels are only needed for `evaluation.detection_metrics`; without them, pass ze
 pytest
 ```
 
-Every read is tested against a Gaussian background, where it has a closed form. The Rao statistic
-is the adaptive matched filter of the smoothed Gaussian, the curvature is the projected precision,
-the log ratio is quadratic, and the GLRT is the squared one-sided AMF. The other tests cover:
-
+The statistics are tested against closed forms. With a zero potential, the model's score is
+affine. Its Rao statistic is then the Ledoit-Wolf AMF, its GLRT the squared one-sided AMF, its
+log ratio quadratic, and its Rao gradient constant. The synthetic scene's oracles are tested in
+the Gaussian limit, and the matched noise level in a closed-form case. Further tests cover:
 - the encoder's blind spot;
-- the folds and a pinned short training run;
-- the implant protocol and the MUUFL halos;
-- each part of the noise-level rule;
-- the metrics, including the AUC convention;
-- the per-scene pipeline end to end;
-- the experiments' own models: the Gaussian and Student-t mixtures against their closed forms,
-  the synthetic scene's exact detectors in the Gaussian limit, and each of Experiment 2's routes
-  to a log ratio with exact networks.
+- the rule's stages, including its selection and its GLRT variant (sigma-hat_G) in closed form;
+- training, its stopping rule, and that it repeats bit for bit;
+- the shipped checkpoints against `checkpoints/SHA256SUMS`;
+- Experiment 4's omega, threshold and level choices;
+- the implant protocol;
+- the metrics;
+- the fetch script's checksums.
 
-The package was also checked on a CPU against the research code that produced the paper's
-numbers.
-
-- **From the paper's checkpoints:** it reproduces every DARTS entry of Tables I and II, and the
-  Experiment 3 and 4 entries checked, to the printed digit, with the same noise levels to the
-  last bit. One AUC differs in the ninth decimal, from the CPU's arithmetic against the GPU's.
-- **Experiment 5:** retrained from scratch on the CPU, it reproduces every stored curve, noise
-  level and PD exactly.
-- **Experiment 1:** rerun in full, it reproduces every stored line exactly.
-- **Figures:** drawn from the stored results, or from the reruns of Experiments 1 and 5, Figs. 1
-  to 5 match the paper's.
-- **Training:** on the CPU, `dartsdet.training.fit` and Experiment 5's fits match the originals
-  bit for bit.
+The package was checked on a CPU against the research code behind the paper's numbers:
+- Table II's metric cells;
+- Table III;
+- every curve of Figs. 2–4;
+- Fig. 3, pixel for pixel.
 
 ## Layout
 
-| Module | Contents |
+| Path | Contents |
 |---|---|
-| `dartsdet/scenes.py`, `dartsdet/muufl.py` | scenes, labels (Fortran pixel order) and the implant protocol |
-| `dartsdet/preprocessing.py` | Ledoit-Wolf ZCA whitening, the signature, the one-sided AMF and the screen |
-| `dartsdet/encoder.py`, `network.py`, `model.py` | the blind-spot context encoder, the noise-conditional head, the score models |
-| `dartsdet/training.py` | five-fold denoising score matching with EMA and early stopping |
-| `dartsdet/reads.py` | the Rao statistic, its curvature, the log-likelihood ratio and the GLRT |
-| `dartsdet/noise_level.py` | the noise-level rule |
-| `dartsdet/pipeline.py` | the per-scene steps the experiments share |
-| `dartsdet/evaluation.py` | the fold ensemble and the metrics |
-| `experiments/` | one driver per experiment, and what only one experiment uses: Experiment 1's mixtures and calibration test, Experiment 2's networks and routes, Experiment 3's scene and DART, Experiment 5's background |
-| `figures/` | the figures, drawn from the experiments' outputs |
-| `configs/` | the DARTS recipe, the scenes, and Experiments 1 and 3's settings |
+| `dartsdet/` | data and implants, whitening and screening, the model, training, the statistics, the noise-level rule, the metrics, the fetch script |
+| `baselines/` | the classical detectors and the Gaussian mixture |
+| `experiments/` | one driver per experiment; `synthetic.py` is Experiment 2's scene and its exact detectors |
+| `paper/` | the tables and figures |
+| `configs/` | the DARTS recipe, the scenes, and each experiment's settings |
+| `checkpoints/`, `results/` | the trained models and the reference outputs |
 
-## Baselines
+## License
 
-The comparison detectors in Tables I and II were run with their authors' released code, with the
-settings described in the paper. That code is not included here.
+MIT; see `LICENSE`.

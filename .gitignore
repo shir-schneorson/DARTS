@@ -229,3 +229,4 @@ CLAUDE.md
 !/.gitignore
 !/README.md
 !/repro/
+!/.github/

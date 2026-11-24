@@ -1,0 +1,14 @@
+{
+  "seeds": [0, 1, 2, 3, 4],
+  "scene": {"side": 256, "regions": 80, "dof": 4.0},
+  "background": {"bands": 10, "components": 8, "separation": 2.0, "eigenvalues": [0.05, 1.0]},
+  "target": {"distance": 3.0, "spread": 0.01, "background_per_target": 100, "spacing": 3},
+  "amplitudes": [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+  "oracle_glrt": {"theta_max": 10.0, "count": 501},
+  "matched_level_grid": {"log10_first": -3, "log10_last": 2, "count": 241},
+  "model": {"channels": 8, "context": 4, "width": 16, "embed_dim": 8},
+  "steps": 4000,
+  "patience": null,
+  "learning_rate": 0.003,
+  "rule_amplitudes": [0.1, 2.0]
+}

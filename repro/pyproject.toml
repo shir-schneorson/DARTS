@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dartsdet"
 version = "0.1.0"
-description = "DARTS: locally most powerful target detection with score-matched background models"
+description = "DARTS: score-matched background models in the Rao test (From Diffusion Models to Score Tests: Target Detection under General Background Distributions)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2", "scipy>=1.13", "scikit-learn>=1.5", "torch>=2.4"]
@@ -18,7 +18,7 @@ test = ["pytest>=8"]
 packages = ["dartsdet"]
 
 [tool.pytest.ini_options]
-testpaths = ["dartsdet", "experiments"]
+testpaths = ["dartsdet", "baselines", "experiments"]
 
 [tool.ruff]
 line-length = 100

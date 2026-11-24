@@ -1,143 +1,169 @@
-"""Experiment 3: the Rao test and the GLRT on a synthetic spatial scene, against the exact scene
-density and the exact context.
+"""Experiment 3 (Fig. 3): the noise level at nonzero amplitudes, on Pavia University and MUUFL.
 
-Per seed, both learned models are fitted once on the target-free scene (`spatial_scene`), whitened
-by its own fit, on its pixels minus its one-sided AMF screen: DART (`experiments.dart`, the score
-head without context) and DARTS (fold `seed` of configs/darts.json), whose noise level comes from
-the rule on that fold's reads. Each implanted scene is whitened by the same fit, so t = W mu_t
-exactly, and DARTS's contexts leave out the implanted scene's own screen. Rows per amplitude:
+Per background (configs/experiment3.json), one model is trained on the implant-free scene and
+serves every signature. Each implanted scene (a class mean of Pavia University or a cloth
+signature of MUUFL, at every amplitude) is whitened by the implant-free scene's fit and screened
+on its own; its contexts leave out its screened pixels. Rows, per scene:
+- DARTS: its Rao test at every level of the rule's grid, the rule's sigma-hat and sigma-u, and
+  its plug-in GLRT at sigma-hat. The rule's reference pool is the model's held-out pixels plus the
+  same share of the implant-free scene's screened pixels (`noise_level.reference_pool`).
+- GMM: the Rao test of the mixture fitted on the pixels the model may read (its usable pixels,
+  held-out fold included; EM, seed 0), and of the same mixture smoothed exactly at each level
+  sigma: N(0, sigma^2 I) in the whitened coordinates adds sigma^2 U U' to every component
+  covariance in the mixture's own coordinates. DARTS's sigma is instead in its standardized
+  coordinates, the whitened bands divided by their standard deviation over the training pixels
+  (0.81-0.99 on Pavia University, 0.87-1.00 on MUUFL), so its levels are close to, not equal to,
+  the GMM's.
+Fig. 3's third model, the DARTS network trained with LRao's objective, is not computed here: its
+curves are stored rows, results/experiment3/<background>-lrao-objective.csv.
+The DARTS models are checkpoints/experiment3/<background>/darts.pt, trained on the implant-free
+scene minus its screen (their record says so); --train trains anew on every pixel of it, on
+--device, for the recipe's steps, stopping early on MUUFL only (a background's `patience` null:
+no early stopping, the final weights kept), and saves to <out>/checkpoints/<background>/darts.pt.
+Statistics run on the CPU.
 
-    oracle/rao, oracle/glrt     the exact scene density
-    oracle_context/rao          the exact density given each pixel's region
-    dart/rao, dart/glrt         DART at the recipe's sigma
-    darts/rao, darts/glrt       DARTS at sigma_hat
-
-Writes <out>/seed<s>.csv, which `figures/figure3.py` draws.
-
-Usage: python -m experiments.experiment3 [--device DEVICE] [--checkpoints DIR] [--out DIR]
-                                         [seed ...]
+Writes <out>/<background>-darts.csv (target, alpha, sigma, test, auc, pd, pauc),
+<out>/<background>-rule.csv (target, alpha, sigma_hat, theta_hat, rho_hat, sigma_u) and
+<out>/<background>-gmm.csv (target, alpha, sigma, auc, pd, pauc). Usage, from
+repro/: python -m experiments.experiment3 [--train] [--device DEVICE] [--data DIR] [--out DIR]
+[--backgrounds pavia,muufl]
 """
 
 import argparse
-import copy
-import csv
+import dataclasses
 import json
+import time
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from dartsdet import evaluation, noise_level, pipeline, preprocessing
-from dartsdet.model import ContextFreeScore, Standardize, checked, save_atomically
-from dartsdet.reads import contexts, glrt, rao
-from experiments import dart
-from experiments import spatial_scene as sp
-from experiments.cli import REPRO, arguments
+from baselines import gmm
+from dartsdet import data, noise_level, statistics, whitening
+from dartsdet.metrics import detection_metrics
+from dartsdet.model import DARTS, pixels
+from dartsdet.training import held_out, train
+from experiments import default_device, write
 
-FIELDS = ("row", "alpha", "seed", "sigma", "auc", "pd", "pauc")
+REPRO = Path(__file__).resolve().parents[1]
 
 
-def dart_model(fx: torch.Tensor, seed: int, config: dict, device: str,
-               path: Path) -> ContextFreeScore:
-    """DART on the whitened kept spectra fx (n, B): loaded from `path` if it is there, refused
-    unless it was fitted with this seed, recipe, scene settings and number of spectra; else
-    fitted and saved. The scene settings stand for the training data, which they fix up to the
-    platform's arithmetic, so a checkpoint stays valid across machines."""
-    spec = config["dart"]
-    scene = {k: config[k] for k in ("scene", "background", "target", "screen_fraction")}
-    record = {"seed": seed, "spec": spec, "scene": scene, "n": len(fx)}
-    if path.exists():
-        saved = checked(torch.load(path, weights_only=True), record, path)
-        model = ContextFreeScore(Standardize(torch.zeros(fx.shape[1]), torch.ones(fx.shape[1])),
-                                 spec["width"], spec["depth"], spec["network"])
-        model.load_state_dict(saved["state"])
-        return model
-    model, epochs = dart.fit(fx.to(device, torch.float32), seed, spec)
+def background(name: str, config: dict, recipe: dict, registry: dict,
+               args: argparse.Namespace) -> tuple[dict, data.Scene, tuple, whitening.Inputs,
+                                                  DARTS]:
+    """(the scene entry, the implant-free scene, its whitening fit, its prepared inputs with the
+    model's training pixels usable, the model)."""
+    entry = registry[config["backgrounds"][name]["scene"]]
+    pre = data.without_targets(data.load(entry | {"alpha": 0.0}, args.data))
+    fitted = whitening.whitening(torch.from_numpy(pre.spectra()[pre.exists]))
+    base = whitening.prepare(pre, recipe["screen"], fitted)
+    every = dataclasses.replace(base, usable=torch.from_numpy(pre.exists))
+    if not args.train:
+        model = DARTS.load(REPRO / "checkpoints" / "experiment3" / name / "darts.pt")
+        return entry, pre, fitted, base if model.record["pixels"] == "screened" else every, model
+    start = time.time()
+    plan = config["backgrounds"][name]
+    spec = recipe | {"training": recipe["training"]
+                     | ({"patience": plan["patience"]} if "patience" in plan else {})}
+    model, record = train(every, spec, config["learning_rate"], config["fold"], args.device)
+    path = args.out / "checkpoints" / name / "darts.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
-    save_atomically({"state": {k: v.cpu() for k, v in model.state_dict().items()},
-                     "stop_epoch": epochs} | record, path)
-    return model.cpu()
+    model.cpu().save(path, **record, pixels="all")
+    print(f"{name}: {record}, {time.time() - start:.0f} s", flush=True)
+    return entry, pre, fitted, every, model
 
 
-def models(scene: dict, config: dict, seed: int, args: argparse.Namespace) -> dict:
-    """The seed's whitening, DARTS model and sigma_hat, and DART in float64 and float32, all from
-    the target-free scene. Its pixel vectors are row-major, so the encoder sees the scene
-    transposed, which is immaterial for this square, isotropic scene."""
-    x = scene["background"]
-    fitted = preprocessing.whitening(x)
-    keep = ~preprocessing.screened(x.numpy(), scene["target_mean"].numpy(),
-                                   config["screen_fraction"])
-    inputs = preprocessing.Inputs((x - fitted[0]) @ fitted[1], torch.from_numpy(keep),
-                                  scene["target_mean"] @ fitted[1], (scene["side"],) * 2)
-    spec = json.loads((REPRO / "configs" / "darts.json").read_text())
-    folder = args.checkpoints / "experiment3" / f"seed{seed}"
-    sigmas = noise_level.grid(spec["sigma_max"])
-    darts = pipeline.fold_model(inputs, spec, seed, args.device, folder / "darts.pt")
-    reads = pipeline.rule_reads(darts, inputs, np.ones(len(keep), dtype=bool), seed, sigmas,
-                                args.device)
-    fit = dart_model(inputs.fx[keep], seed, config, args.device, folder / "dart.pt")
-    fit = fit.eval().requires_grad_(False)
-    sigma = pipeline.sigma_hat([reads], sigmas)
-    return {"fitted": fitted, "darts": darts, "sigma": sigma,
-            "dart64": copy.deepcopy(fit).double(), "dart32": fit.float()}
+def scenes(name: str, config: dict, recipe: dict, setup: tuple, args: argparse.Namespace,
+           keys: Iterable[tuple[int, float]] | None = None,
+           ) -> Iterator[tuple[int, float, data.Scene, whitening.Inputs]]:
+    """(target, alpha, scene, inputs) of the implanted scenes of a background, whitened by the
+    implant-free scene's fit and screened on its own, loaded one at a time (a Pavia University
+    scene and its inputs hold about 0.3 GB): every (target, alpha) of the plan, target by target,
+    or those of `keys` in their order."""
+    entry, _, fitted, _, _ = setup
+    plan = config["backgrounds"][name]
+    for target, alpha in keys or [(t, a) for t in plan["targets"] for a in plan["amplitudes"]]:
+        scene = data.load(entry | {"target": target, "alpha": alpha}, args.data)
+        yield target, alpha, scene, whitening.prepare(scene, recipe["screen"], fitted)
 
 
-def learned_rows(m: dict, x: torch.Tensor, keep: np.ndarray, side: int, t: torch.Tensor,
-                 config: dict, device: str) -> dict[str, tuple[float, np.ndarray]]:
-    """(sigma, statistic (P,)) of the DART and DARTS rows on one implanted scene: DART's Rao in
-    float64 on the CPU, its GLRT in float32; DARTS's on `device`."""
-    mean, matrix = m["fitted"]
-    fx, t_w = (x - mean) @ matrix, t @ matrix
-    grid = (config["glrt"]["theta_max"], config["glrt"]["n_theta"])
-    t_hat, t_norm = t_w / t_w.norm(), float(t_w.norm())
-    s_dart, s_darts = config["dart"]["sigma"], m["sigma"]
-    z64, z32 = m["dart64"].coordinates(fx), m["dart32"].coordinates(fx.float())
-    empty = torch.zeros(len(x), 0)
-    zc, ctx = contexts(m["darts"], fx.float().to(device), torch.from_numpy(keep).to(device),
-                       (side, side))
-    t32 = t_hat.float().to(device)
-    with torch.no_grad():
-        dart_rao = rao(m["dart64"], z64, empty.double(), t_hat, s_dart).numpy()
-        darts_rao = rao(m["darts"], zc, ctx, t32, s_darts).cpu().double().numpy()
-    return {"dart/rao": (s_dart, dart_rao),
-            "dart/glrt": (s_dart, glrt(m["dart32"], z32, empty, t_hat.float(), t_norm, s_dart,
-                                       grid).double().numpy()),
-            "darts/rao": (s_darts, darts_rao),
-            "darts/glrt": (s_darts, glrt(m["darts"], zc, ctx, t32, t_norm, s_darts,
-                                         grid).double().numpy())}
+def gmm_rows(name: str, config: dict, setup: tuple, implanted: Iterable[tuple]) -> list[dict]:
+    """The smoothed GMM's Rao test on every implanted scene, at every level of `gmm.sigmas`."""
+    base, settings = setup[3], config["gmm"]
+    model = gmm.fit(base.fx[base.usable], settings["components"][name], settings["seed"],
+                    settings["reg_covar"])
+    print(name, f"GMM converged {model.converged}", flush=True)
+    rows = []
+    for target, alpha, scene, inputs in implanted:
+        for sigma in settings["sigmas"]:
+            unmix = model.unmix
+            smoothed = model._replace(covariances=model.covariances + sigma**2 * (unmix @ unmix.T))
+            terms = gmm.line(smoothed, inputs.fx, inputs.t)
+            score = gmm.rao(smoothed.weights.double().log(), terms)
+            metrics = detection_metrics(scene.labels, score.numpy())
+            rows.append({"target": target, "alpha": alpha, "sigma": sigma,
+                         **{k: f"{v:.4f}" for k, v in metrics.items()}})
+    return rows
 
 
-def amplitude_rows(scene: dict, m: dict, alpha: float, config: dict, device: str) -> list[dict]:
-    """Every row of one amplitude."""
-    x, labels = sp.implanted(scene, alpha)
-    t = scene["target_mean"]
-    keep = ~preprocessing.screened(x.numpy(), t.numpy(), config["screen_fraction"])
-    glrt_grid = (config["glrt"]["theta_max"], config["glrt"]["n_theta"])
-    stats = {"oracle/rao": (0.0, sp.oracle_rao(scene["oracle"], x, t).numpy()),
-             "oracle/glrt": (0.0, sp.oracle_glrt(scene["oracle"], x, t, *glrt_grid).numpy()),
-             "oracle_context/rao": (0.0, sp.oracle_context(scene, x, t).numpy())}
-    stats |= learned_rows(m, x, keep, scene["side"], t, config, device)
-    return [{"row": row, "alpha": alpha, "seed": scene["seed"], "sigma": sigma,
-             **evaluation.detection_metrics(labels, stat)} for row, (sigma, stat) in stats.items()]
+def darts_rows(name: str, config: dict, recipe: dict, setup: tuple,
+               implanted: Iterable[tuple]) -> tuple[list[dict], list[dict]]:
+    """(metric rows, rule rows) of DARTS on every implanted scene of a background."""
+    _, pre, _, base, model = setup
+    plan = config["backgrounds"][name]
+    held = held_out(base.usable, config["fold"], recipe["training"]["folds"])[0]
+    pool = noise_level.reference_pool(held, base.usable, torch.from_numpy(pre.exists))
+    rule = noise_level.Rule.from_config(recipe, (min(plan["amplitudes"]), max(plan["amplitudes"])))
+    grid = recipe["glrt_amplitudes"]
+    amplitudes = torch.logspace(grid["log10_first"], grid["log10_last"], grid["count"])
+    rows, rules, reads = [], [], {}
+    for target, alpha, scene, inputs in implanted:
+        start = time.time()
+        if target not in reads:  # one signature, one set of held-out reads
+            reads[target] = noise_level.held_out_reads(
+                model, dataclasses.replace(base, t=inputs.t), pool, rule)
+        screened = torch.from_numpy(np.flatnonzero(scene.exists & ~inputs.usable.numpy()))
+        chosen = noise_level.select(model, reads[target], inputs, screened, rule)
+        z, mask = model.image(inputs.fx, inputs.usable, inputs.grid)
+        key = {"target": target, "alpha": alpha}
+        for sigma in rule.sigmas:
+            c = statistics.contexts(model, z, mask, sigma)
+            scores = {"Rao": statistics.rao(model, pixels(z), c, inputs.t, sigma).double()}
+            if sigma == chosen["sigma_hat"]:
+                scores["GLRT"] = statistics.glrt(model, pixels(z), c, inputs.t, sigma,
+                                                 amplitudes)
+            for test, score in scores.items():
+                metrics = detection_metrics(scene.labels, score.numpy())
+                rows.append(key | {"sigma": f"{sigma:.4f}", "test": test,
+                                   **{k: f"{v:.4f}" for k, v in metrics.items()}})
+        rules.append(key | {k: f"{chosen[k]:.4f}" for k in
+                            ("sigma_hat", "theta_hat", "rho_hat", "sigma_u")})
+        print(name, key, rules[-1], f"{time.time() - start:.0f} s", flush=True)
+    return rows, rules
 
 
 def main() -> None:
-    parser = arguments(__doc__, "experiment3", device=True, data=False, checkpoints=True)
-    config = json.loads((REPRO / "configs" / "experiment3.json").read_text())
-    parser.add_argument("seeds", nargs="*", type=int, default=list(range(config["n_seeds"])),
-                        help="scene seeds to run")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--train", action="store_true", help="train the DARTS models anew")
+    parser.add_argument("--device", default=default_device())
+    parser.add_argument("--data", type=Path, default=REPRO.parent / "data")
+    parser.add_argument("--out", type=Path, default=REPRO / "outputs" / "experiment3")
+    parser.add_argument("--backgrounds", default="pavia,muufl")
     args = parser.parse_args()
+    recipe = json.loads((REPRO / "configs" / "darts.json").read_text())
+    config = json.loads((REPRO / "configs" / "experiment3.json").read_text())
+    registry = json.loads((REPRO / "configs" / "scenes.json").read_text())
     args.out.mkdir(parents=True, exist_ok=True)
-    for seed in args.seeds:
-        scene = sp.draw_scene(config, seed) | {"seed": seed}
-        m = models(scene, config, seed, args)
-        print(f"seed {seed}: sigma_hat {m['sigma']:.4g}", flush=True)
-        rows = [r for alpha in config["alphas"]
-                for r in amplitude_rows(scene, m, alpha, config, args.device)]
-        with (args.out / f"seed{seed}.csv").open("w", newline="") as f:
-            writer = csv.DictWriter(f, FIELDS)
-            writer.writeheader()
-            writer.writerows(rows)
+    for name in args.backgrounds.split(","):
+        setup = background(name, config, recipe, registry, args)
+        write(args.out / f"{name}-gmm.csv",
+              gmm_rows(name, config, setup, scenes(name, config, recipe, setup, args)))
+        rows, rules = darts_rows(name, config, recipe, setup,
+                                 scenes(name, config, recipe, setup, args))
+        write(args.out / f"{name}-darts.csv", rows)
+        write(args.out / f"{name}-rule.csv", rules)
 
 
 if __name__ == "__main__":

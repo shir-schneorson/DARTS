@@ -1,7 +1,6 @@
 data/
-checkpoints/
-results/
 __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+outputs/

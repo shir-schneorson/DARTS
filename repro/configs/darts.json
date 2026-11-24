@@ -1,40 +1,39 @@
 {
-  "sigma_min": 0.005,
-  "sigma_max": 4.0,
-  "width": 256,
-  "depth": 3,
-  "network": {
-    "activation": "GELU",
-    "embed_dim": 64,
-    "fourier_scale": 0.25
+  "model": {
+    "channels": 16,
+    "dilations": [1, 1, 2, 2, 4, 1],
+    "shift": 1,
+    "context": 8,
+    "width": 32,
+    "depth": 2,
+    "expand": 4,
+    "embed_dim": 16,
+    "fourier_scale": 0.25,
+    "activation": "SiLU"
   },
-  "encoder": {
-    "channels": 64,
-    "dilations": [
-      1,
-      1,
-      2,
-      2,
-      4,
-      1
-    ],
-    "shift": 2,
-    "context": 48,
-    "activation": "GELU"
-  },
-  "train": {
-    "lr": 0.001,
-    "max_steps": 6000,
-    "eval_every": 100,
-    "patience": 15,
+  "training": {
+    "sigma_min": 0.005,
+    "sigma_max": 4.0,
     "folds": 5,
+    "steps": 20000,
     "crop": 160,
-    "centres": 8192,
-    "training": {
-      "weight_decay": 0.0001,
-      "warmup": 500,
-      "clip": 1.0,
-      "ema": 0.999
-    }
+    "crops": 4,
+    "weight_decay": 0.0001,
+    "warmup": 500,
+    "clip": 1.0,
+    "ema": 0.999,
+    "validate_every": 100,
+    "validation_sigmas": [0.02, 0.1, 0.5, 2.0],
+    "patience": 500,
+    "checkpoint_every": 500
+  },
+  "screen": 0.1,
+  "glrt_amplitudes": {"log10_first": -3, "log10_last": 1, "count": 81},
+  "rule": {
+    "noise_levels": {"first": 0.005, "base": 200, "steps_per_base": 12, "count": 16},
+    "loud_distances": [0.25, 0.5, 1.0, 2.0, 4.0],
+    "loud_alpha": 0.01,
+    "rhos": [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1],
+    "implants": 2000
   }
 }

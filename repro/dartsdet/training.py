@@ -1,31 +1,36 @@
-"""K-fold denoising score matching of the conditional score.
+"""Denoising score matching of the conditional score model (Sections V-C and V-E, Algorithm 1).
 
-Fold j holds out every K-th usable pixel of one fixed random order as validation centres; they stay
-visible in the other pixels' contexts, and K folds hold out every usable pixel once. A training
-step takes a random crop (a window plus the context margin, under one of the 8 dihedral
-transforms), computes its contexts, and draws a noise level and a noise per training centre in it.
-AdamW with a linear warmup and a cosine decay, gradient clipping, and an EMA of the weights; the EMA
-state with the lowest held-out loss, at draws fixed for the run, is kept, and training stops after
-`patience` validations without a new minimum.
+A fifth of the usable (unscreened) pixels are held out: fold j of 5 of one fixed random order,
+drawn with seed 0. Held-out pixels stay visible to the contexts but are never training centres.
+Each step takes `crops` random crops of the image, each under a random dihedral transform and
+with its own noise level, log-uniform on [sigma_min, sigma_max]. The centres of a crop are noised,
+u = a z + s eps, while its contexts read the clean a z. The loss is eq. (dsm-loss) with
+w(sigma) = a^-2, over the crop's training centres. AdamW with a linear warmup, gradient clipping,
+and an exponential moving average (EMA) of the weights.
 
-The fold index seeds the model's initialization and every training draw; the fold partition
-itself is one fixed order, drawn with seed 0. Fold j of a scene is therefore a pure function of the
-scene, the recipe and j, up to the device's arithmetic.
+Every `validate_every` steps, the EMA model's loss on the held-out pixels is computed at fixed
+noise levels and fixed draws. Once the warmup and the EMA's horizon 1 / (1 - decay) have passed,
+training stops when that loss has not improved for `patience` steps. The model kept is the EMA
+state at the last multiple of `checkpoint_every` steps at or before the lowest held-out loss. With
+`patience` null, as for Experiment 2 and Pavia University in Experiment 3, training runs every
+step and keeps the final EMA state.
+
+The fold seeds the initialization and every draw, so a run is a function of the scene, the
+recipe, the learning rate and the fold, up to the device's arithmetic.
 """
 
-import math
 import time
-from functools import partial
 
 import torch
-import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
-from dartsdet.model import ContextFreeScore, ScoreModel, Standardize, vp_coefficients
+from dartsdet.model import DARTS, pixels, vp
+from dartsdet.whitening import Inputs
 
 
 def held_out(usable: torch.Tensor, fold: int, folds: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """(held-out, kept) pixel indices of fold `fold` of `folds` over the usable pixels (n,) bool."""
+    """(held-out, kept) pixel indices: fold `fold` of `folds` of the usable pixels (P,) bool, in
+    one fixed random order drawn with seed 0."""
     rows = torch.nonzero(usable).squeeze(1)
     order = rows[torch.randperm(len(rows), generator=torch.Generator().manual_seed(0))]
     chosen = torch.zeros(len(rows), dtype=torch.bool)
@@ -33,131 +38,129 @@ def held_out(usable: torch.Tensor, fold: int, folds: int) -> tuple[torch.Tensor,
     return order[chosen], order[~chosen]
 
 
-def log_uniform(n: int, low: float, high: float, generator: torch.Generator) -> torch.Tensor:
-    """n noise levels, log-uniform on [low, high]."""
-    return low * (high / low) ** torch.rand(n, generator=generator)
+def crops(images: list[torch.Tensor], size: int, count: int,
+          generator: torch.Generator) -> list[torch.Tensor]:
+    """`count` random crops of side `size` (at most the image's) of each of `images`
+    (1, ., W, H), all of them cut at the same window and dihedral transform (k >= 4: transposed,
+    then k % 4 quarter turns); concatenated, (count, ., w, h). A non-square crop keeps its shape:
+    identity or half turn."""
+    W, H = images[0].shape[2:]
+    w, h = min(size, W), min(size, H)
+    out = []
+    for _ in range(count):
+        r0 = int(torch.randint(W - w + 1, (1,), generator=generator))
+        c0 = int(torch.randint(H - h + 1, (1,), generator=generator))
+        k = int(torch.randint(8 if w == h else 4, (1,), generator=generator))
+        k = k if w == h else 2 * (k % 2)
+        windows = [image[:, :, r0:r0 + w, c0:c0 + h] for image in images]
+        out.append([torch.rot90(v.transpose(-1, -2) if k >= 4 else v, k % 4, (-2, -1))
+                    for v in windows])
+    return [torch.cat(parts) for parts in zip(*out, strict=True)]
 
 
-def lr_factor(step: int, steps: int, warmup: int) -> float:
-    """Learning-rate multiplier after `step` steps: linear warmup to 1 over `warmup` steps, times a
-    cosine decay from 1 at step 0 to 0 at `steps`."""
-    return min(1.0, (step + 1) / max(warmup, 1)) * 0.5 * (1 + math.cos(math.pi * step / steps))
+def image_epsilon(model: DARTS, u: torch.Tensor, image: torch.Tensor, mask: torch.Tensor,
+                  sigma: torch.Tensor, create_graph: bool) -> torch.Tensor:
+    """eps_hat (N, B, W, H) at every pixel of the inputs u (N, B, W, H), each context read from
+    the clean a z `image` (N, B, W, H) at the pixels of `mask` (N, 1, W, H); sigma (N,), one level
+    per image."""
+    n, b, w, h = u.shape
+    with torch.set_grad_enabled(create_graph):
+        c = pixels(model.contexts(image, mask, sigma.log()))
+    eps_hat = model.epsilon(pixels(u), c, sigma.repeat_interleave(w * h), create_graph)
+    return eps_hat.reshape(n, w, h, b).permute(0, 3, 1, 2)
 
 
-def optimization(model: torch.nn.Module, train: dict) -> tuple[
-        torch.optim.AdamW, torch.optim.lr_scheduler.LambdaLR, AveragedModel]:
-    """(AdamW, its warmup-cosine schedule, an EMA of the model) for the recipe's `train` block."""
-    scheme = train["training"]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train["lr"],
-                                  weight_decay=scheme["weight_decay"])
-    factor = partial(lr_factor, steps=train["max_steps"], warmup=scheme["warmup"])
-    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(scheme["ema"]), use_buffers=True)
-    return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, factor), ema
+def dsm_error(eps_hat: torch.Tensor, noise: torch.Tensor, a: float | torch.Tensor,
+              weight: torch.Tensor) -> torch.Tensor:
+    """Eq. (dsm-loss): |eps_hat - eps|^2 / (B a^2) averaged over the pixels of `weight`
+    (N, 1, W, H); eps_hat and noise (N, B, W, H)."""
+    error = ((eps_hat - noise) ** 2).mean(1, keepdim=True) / a**2
+    return (error * weight).sum() / weight.sum()
 
 
-def dsm_loss(model: ScoreModel | ContextFreeScore, zc: torch.Tensor, context: torch.Tensor,
-             sigma: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-    """(eps_hat - eps)^2 / a^2, the v-parametrization's loss, averaged over centres and bands:
-    standardized centres zc (n, B) with contexts (n, C), noise levels sigma (n,), noises (n, B)."""
-    a, s = vp_coefficients(sigma[:, None])
-    return ((model.epsilon(a * zc + s * noise, context, sigma) - noise) ** 2 / a**2).mean()
+def validation_loss(model: DARTS, z: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor,
+                    sigmas: list[float], noises: list[torch.Tensor]) -> float:
+    """The mean over `sigmas` of `dsm_error` on the pixels of `weight` (1, 1, W, H), the whole
+    image z (1, B, W, H) noised with the fixed draws `noises`."""
+    losses = []
+    for sigma, noise in zip(sigmas, noises, strict=True):
+        a, s = vp(sigma)
+        noised = (a * z + s * noise) * mask
+        level = torch.full((1,), sigma, device=z.device)
+        eps_hat = image_epsilon(model, noised, a * z * mask, mask, level, False)
+        losses.append(float(dsm_error(eps_hat, noise, a, weight)))
+    return sum(losses) / len(losses)
 
 
-def validation_loss(model: ScoreModel, z: torch.Tensor, mask: torch.Tensor, rows: torch.Tensor,
-                    sigma: torch.Tensor, noise: torch.Tensor) -> float:
-    """`dsm_loss` of the held-out centres `rows` at fixed draws, contexts from the whole image."""
-    with torch.no_grad():
-        context = model.encoder(z, mask)[0].flatten(1).T[rows.to(z.device)]
-        zc = z[0].flatten(1).T[rows.to(z.device)]
-        return float(dsm_loss(model, zc, context, sigma, noise))
-
-
-def crop_batch(model: ScoreModel, padded: list[torch.Tensor], grid: tuple[int, int], train: dict,
-               generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-    """(centres (n, B), contexts (n, C)) of the training centres in one random crop, at most
-    `centres` of them. padded: the image, the mask and the training-centre mask, each padded by
-    the encoder's margin."""
-    W, H = grid
-    margin = model.encoder.margin()
-    cw, ch = min(train["crop"], W), min(train["crop"], H)
-    r0 = int(torch.randint(W - cw + 1, (1,), generator=generator))
-    c0 = int(torch.randint(H - ch + 1, (1,), generator=generator))
-    k = int(torch.randint(8, (1,), generator=generator))
-    zw, mw, kw = (v[:, :, r0:r0 + cw + 2 * margin, c0:c0 + ch + 2 * margin] for v in padded)
-    context = dihedral(model.encoder(dihedral(zw, k), dihedral(mw, k)), k, inverse=True)
-    inner = (slice(None), slice(None), slice(margin, margin + cw), slice(margin, margin + ch))
-    context, zc = context[inner], zw[inner]
-    chosen = kw[inner][0, 0].flatten().nonzero().squeeze(1)
-    if len(chosen) > train["centres"]:
-        draw = torch.randperm(len(chosen), generator=generator)[: train["centres"]]
-        chosen = chosen[draw.to(chosen.device)]
-    return zc[0].flatten(1).T[chosen], context[0].flatten(1).T[chosen]
-
-
-def setup(fx: torch.Tensor, usable: torch.Tensor, grid: tuple[int, int], fold: int, spec: dict,
-          device: str) -> tuple[ScoreModel, torch.Tensor, torch.Tensor, list, torch.Tensor]:
-    """(model, image, mask, padded crops' inputs, held-out rows) of fold `fold`, untrained."""
-    val, kept = held_out(usable, fold, spec["train"]["folds"])
-    coordinates = Standardize.fit(fx[kept].double()).float()
+def setup(inputs: Inputs, recipe: dict, fold: int, device: str) -> tuple:
+    """(untrained model, standardized image z (1, B, W, H), mask (1, 1, W, H), training and
+    held-out pixel weights (1, 1, W, H) each, the run's generator, the fixed validation noises) of
+    fold `fold`. The standardization is that of the training pixels."""
+    spec = recipe["training"]
+    val, kept = held_out(inputs.usable, fold, spec["folds"])
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(fold)
-        model = ScoreModel(coordinates, spec)
+        model = DARTS(inputs.fx.shape[1], recipe["model"])
+    x = inputs.fx[kept].double()
+    model.mean.copy_(x.mean(dim=0))
+    model.std.copy_(x.std(dim=0, correction=0))
     model.to(device)
-    z, mask = model.image(fx.float().to(device), usable.to(device), grid)
-    centres = torch.zeros(len(fx), dtype=torch.bool)
-    centres[kept] = True
-    centres = centres.reshape(grid)[None, None].float().to(device)
-    m = model.encoder.margin()
-    padded = [F.pad(v, (m, m, m, m)) for v in (z, mask, centres)]
-    return model, z, mask, padded, val
-
-
-def fit(fx: torch.Tensor, usable: torch.Tensor, grid: tuple[int, int], fold: int, spec: dict,
-        device: str) -> ScoreModel:
-    """Fold `fold` of the recipe `spec` on whitened spectra fx (P, B) in pixel order,
-    trained on the usable pixels (P,) bool: the EMA state with the lowest held-out loss."""
-    train = spec["train"]
+    z, mask = model.image(inputs.fx, inputs.usable, inputs.grid)
+    weights = []
+    for rows in (kept, val):
+        weight = torch.zeros(len(inputs.usable), device=device)
+        weight[rows.to(device)] = 1
+        weights.append(weight.reshape(inputs.grid)[None, None])
     generator = torch.Generator().manual_seed(fold)
-    model, z, mask, padded, val = setup(fx, usable, grid, fold, spec, device)
-    val_sigma = log_uniform(len(val), model.sigma_min, model.sigma_max, generator).to(device)
-    val_noise = torch.randn(len(val), z.shape[1], generator=generator).to(device)
-    optimizer, scheduler, ema = optimization(model, train)
-    best, best_state, window, start = math.inf, None, [], time.time()
-    for step in range(1, train["max_steps"] + 1):
-        zc, context = crop_batch(model, padded, grid, train, generator)
-        sigma = log_uniform(len(zc), model.sigma_min, model.sigma_max, generator).to(device)
-        noise = torch.randn(len(zc), zc.shape[1], generator=generator).to(device)
-        loss = dsm_loss(model, zc, context, sigma, noise)
+    noises = [torch.randn(z.shape, generator=generator).to(device)
+              for _ in spec["validation_sigmas"]]
+    return model, z, mask, weights, generator, noises
+
+
+def train(inputs: Inputs, recipe: dict, lr: float, fold: int, device: str) -> tuple[DARTS, dict]:
+    """(the model kept, its record: `step`, `best_step`, `held_out_loss`, `stopped`) of fold
+    `fold`, trained on the usable pixels of `inputs` with the recipe (configs/darts.json) at
+    learning rate `lr`. If training ends before any held-out loss is recorded, the final EMA."""
+    spec = recipe["training"]
+    model, z, mask, (centres, held), generator, noises = setup(inputs, recipe, fold, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=spec["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: min(1.0, (step + 1) / spec["warmup"]))
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(spec["ema"]), use_buffers=True)
+    counted_from = spec["warmup"] + round(1 / (1 - spec["ema"]))
+    best, best_step, chosen, snapshot, window, start = float("inf"), 0, None, None, [], time.time()
+    for step in range(1, spec["steps"] + 1):
+        clean, m, weight = crops([z, mask, centres], spec["crop"], spec["crops"], generator)
+        low, high = spec["sigma_min"], spec["sigma_max"]
+        sigma = (low * (high / low) ** torch.rand(spec["crops"], generator=generator)).to(z.device)
+        noise = torch.randn(clean.shape, generator=generator).to(z.device)
+        a, s = vp(sigma[:, None, None, None])
+        eps_hat = image_epsilon(model, (a * clean + s * noise) * m, a * clean * m, m, sigma, True)
+        loss = dsm_error(eps_hat, noise, a, weight)
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), train["training"]["clip"])
+        torch.nn.utils.clip_grad_norm_(model.parameters(), spec["clip"])
         optimizer.step()
         scheduler.step()
         ema.update_parameters(model)
         window.append(float(loss.detach()))
-        if step % train["eval_every"]:
+        if step % spec["validate_every"]:
             continue
-        current = validation_loss(ema.module, z, mask, val, val_sigma, val_noise)
-        model.history.append(sum(window) / len(window))
-        model.validation.append((step, current))
+        current = validation_loss(ema.module, z, mask, held, spec["validation_sigmas"], noises)
+        if step % spec["checkpoint_every"] == 0:
+            snapshot = {k: v.detach().clone() for k, v in ema.module.state_dict().items()}
+        print(f"[train] fold {fold} step {step} train {sum(window) / len(window):.6f} held-out "
+              f"{current:.6f} best {best_step} ({time.time() - start:.0f} s)", flush=True)
         window = []
-        if current < best:
-            best, model.best_step = current, step
-            best_state = {k: v.detach().clone() for k, v in ema.module.state_dict().items()}
-        print(f"[fit] fold {fold} step {step} train {model.history[-1]:.4f} val {current:.4f} "
-              f"best {model.best_step} ({time.time() - start:.0f} s)", flush=True)
-        if (step - model.best_step) // train["eval_every"] >= train["patience"]:
+        if step >= counted_from and current < best:
+            best, best_step, chosen = current, step, snapshot
+        elif (spec["patience"] is not None and step >= counted_from
+              and step - best_step >= spec["patience"]):
             break
-    if best_state is None:
-        raise RuntimeError(f"fold {fold}: no finite validation loss in {step} steps")
-    model.load_state_dict(best_state)
-    return model
-
-
-def dihedral(x: torch.Tensor, k: int, inverse: bool = False) -> torch.Tensor:
-    """The k-th of the 8 dihedral transforms of the last two axes (k >= 4: transpose first), or
-    its inverse."""
-    if not inverse:
-        return torch.rot90(x.transpose(-1, -2) if k >= 4 else x, k % 4, (-2, -1))
-    y = torch.rot90(x, -(k % 4), (-2, -1))
-    return y.transpose(-1, -2) if k >= 4 else y
+    if spec["patience"] is None:
+        chosen = None
+    model.load_state_dict(ema.module.state_dict() if chosen is None else chosen)
+    every = spec["checkpoint_every"]
+    record = {"step": step if chosen is None else best_step // every * every,
+              "best_step": best_step, "held_out_loss": best, "stopped": step}
+    return model.eval(), record
