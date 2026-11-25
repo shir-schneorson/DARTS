@@ -133,28 +133,9 @@ ul, ol { margin: 0 0 1.1rem; padding-left: 1.4rem; }
 li { margin-bottom: 0.35rem; }
 strong { font-weight: 600; }
 
-/* TL;DR */
+/* Summary */
 .tldr { padding-top: 3rem; }
 .lead { font-size: 1.3rem; line-height: 1.55; }
-.glance {
-  list-style: none;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: 1rem;
-  margin: 2rem 0 0;
-  padding: 0;
-}
-.glance li {
-  margin: 0;
-  padding: 1rem 1.1rem;
-  border: 1px solid var(--line);
-  border-top: 3px solid var(--accent);
-  border-radius: 0.5rem;
-  background: var(--surface);
-  font-size: 1rem;
-  line-height: 1.5;
-}
-.glance strong { display: block; margin-bottom: 0.3rem; font-family: var(--sans); }
 
 /* Contents */
 .toc {
